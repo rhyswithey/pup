@@ -3,7 +3,7 @@ import io
 import pandas as pd
 import streamlit as st
 
-# -------- Patterns (tuned) --------
+# -------- Patterns --------
 ORDER_RE = re.compile(r"\b(2\d{8})\b")
 DATE_RE  = re.compile(r"\b(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\b")
 
@@ -12,22 +12,62 @@ STATUS_RE = re.compile(
     re.IGNORECASE
 )
 
-# RACK HIGH-04-PUP / RACK LOW-05-PUP / CUBE-7-PUP /
-# A-02-PUP / A-03 PUP / B-01PUP / B-08*PUP / BOX-PUP / PUP-BOX
-LOC_RE = re.compile(r"""
-(
-    RACK \s+ (?:HIGH|LOW) \s* -? \s* \d{2} \s* - \s* PUP |
-    CUBE \s* - \s* \d+ \s* - \s* PUP |
-    [A-Z] \s* - \s* \d{2} \s* \*? \s* -? \s* PUP |
-    [A-Z] \s* -? \s* \d{2} PUP |
-    PUP \s* - \s* BOX |
-    BOX \s* - \s* PUP
-)
-""", re.IGNORECASE | re.VERBOSE)
+# Fallback text only if no location is found
+NOTES_RE = re.compile(r"(Incom[^\n]*|remaining item[^\n]*|missing[^\n]*)", re.IGNORECASE)
 
-# “Notes-like” fragments that we’ll only use as a LOCATION fallback
-NOTES_RE = re.compile(r"(Incom[^\n]*|remaining item[^\n]*|missing[^\n]*)",
-                      re.IGNORECASE)
+def build_location_patterns():
+    pats = []
+    # A-01..A-13 PUP
+    for i in range(1, 14):
+        dd = f"{i:02d}"
+        pats.append((
+            re.compile(rf"\bA\s*-?\s*{dd}\s*\*?\s*-?\s*PUP\b", re.IGNORECASE),
+            f"A-{dd} PUP"
+        ))
+    # B-01..B-12 PUP
+    for i in range(1, 13):
+        dd = f"{i:02d}"
+        pats.append((
+            re.compile(rf"\bB\s*-?\s*{dd}\s*\*?\s*-?\s*PUP\b", re.IGNORECASE),
+            f"B-{dd} PUP"
+        ))
+    # PUP-BOX
+    pats.append((
+        re.compile(r"\bPUP\s*-?\s*BOX\b", re.IGNORECASE),
+        "PUP-BOX"
+    ))
+    # RACK-HIGH-01..06-PUP and RACK-LOW-01..06-PUP
+    for lvl in ["HIGH", "LOW"]:
+        for i in range(1, 7):
+            dd = f"{i:02d}"
+            pats.append((
+                re.compile(rf"\bRACK\s*-?\s*{lvl}\s*-?\s*{dd}\s*-?\s*PUP\b", re.IGNORECASE),
+                f"RACK-{lvl}-{dd}-PUP"
+            ))
+    # CUBE-1..9-PUP
+    for i in range(1, 10):
+        pats.append((
+            re.compile(rf"\bCUBE\s*-?\s*{i}\s*-?\s*\*?\s*PUP\b", re.IGNORECASE),
+            f"CUBE-{i}-PUP"
+        ))
+    # PALLETS PUP
+    pats.append((
+        re.compile(r"\bPALLETS\s+PUP\b", re.IGNORECASE),
+        "PALLETS PUP"
+    ))
+    # PUP DOOR
+    pats.append((
+        re.compile(r"\bPUP\s*-?\s*DOOR\b", re.IGNORECASE),
+        "PUP DOOR"
+    ))
+    # NEXT TO CUBES
+    pats.append((
+        re.compile(r"\bNEXT\s+TO\s+CUBES\b", re.IGNORECASE),
+        "NEXT TO CUBES"
+    ))
+    return pats
+
+LOC_PATTERNS = build_location_patterns()
 
 # -------- Extractors --------
 def parse_blocks(text: str):
@@ -44,12 +84,22 @@ def extract_status(block_text: str) -> str:
     return m.group(1).capitalize() if m else ""
 
 def extract_location(block_text: str):
-    # Return the *last* matching location (closest to the end)
-    locs = list(LOC_RE.finditer(block_text))
-    return (locs[-1].group(1) if locs else ""), (locs[-1].start() if locs else None)
+    """
+    Return (canonical_location, start_index) for the LAST occurrence in the block,
+    matching ONLY the allowed location list, but forgiving spaces/hyphens and optional '*'.
+    Trailing notes like '2 trolleys' won't be included.
+    """
+    best = None  # (start_index, canonical)
+    for rx, canon in LOC_PATTERNS:
+        for m in rx.finditer(block_text):
+            if (best is None) or (m.start() > best[0]):
+                best = (m.start(), canon)
+    if best:
+        return best[1], best[0]
+    return "", None
 
-def extract_service_date(block_text: str, loc_start):
-    # Take the last date BEFORE the location (if found). Otherwise last date in block.
+def extract_service_date(block_text: str, loc_start: int | None) -> str:
+    # Take the last date BEFORE the location (if found). Otherwise last date in the block.
     scan_upto = loc_start if loc_start is not None else len(block_text)
     candidates = [m.group(1) for m in DATE_RE.finditer(block_text[:scan_upto])]
     return candidates[-1] if candidates else ""
@@ -57,9 +107,6 @@ def extract_service_date(block_text: str, loc_start):
 def extract_notes(block_text: str) -> str:
     notes = NOTES_RE.findall(block_text)
     return "; ".join(n.strip() for n in notes) if notes else ""
-
-def normalize_loc(loc: str) -> str:
-    return loc.upper().replace("  ", " ").replace(" -", "-").replace("- ", "-")
 
 # -------- UI --------
 st.set_page_config(page_title="Order Text → Table", page_icon="📦")
@@ -85,36 +132,30 @@ if parse_clicked:
     else:
         rows = []
         for order_no, block in parse_blocks(raw):
-            # Find location and its position first
             loc, loc_start = extract_location(block)
-            # Service date = last timestamp before the location (or last in block if no location)
             svc_date = extract_service_date(block, loc_start)
             status = extract_status(block)
 
-            # If no location match, fall back to "notes-like" text and put it in Location
-            if loc:
-                location_value = normalize_loc(loc)
-            else:
+            # If no allowed location is found, fall back to notes-like text in Location (as requested).
+            if not loc:
                 fallback = extract_notes(block)
-                location_value = fallback.strip() if fallback else ""
+                loc = fallback if fallback else ""
 
             rows.append({
                 "Order number": order_no,
                 "Status": status,
                 "Service date": svc_date,
-                "Location": location_value,
+                "Location": loc,
             })
 
         df = pd.DataFrame(rows, columns=["Order number", "Status", "Service date", "Location"])
-
-        # Parse date for sorting/display
         df["Service date"] = pd.to_datetime(df["Service date"], errors="coerce")
         df = df.sort_values("Service date", ascending=not sort_desc).reset_index(drop=True)
 
         st.subheader("Parsed table")
         st.dataframe(df, use_container_width=True)
 
-        # Quick QA helpers (no Notes references anymore)
+        # QA helper
         with st.expander("⚙️ Quality checks / troubleshooting"):
             missing = df[
                 (df["Order number"].isna()) |
@@ -135,4 +176,4 @@ if parse_clicked:
         st.download_button("Download Excel", data=xls_buf.getvalue(), file_name="orders.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-st.caption("Notes logic removed. If no location is found, any 'Incom / remaining item / missing …' text is shown in the Location column instead.")
+st.caption("Location is restricted to your approved list, with tolerant matching. If no location is found, 'notes-like' text is used instead.")
